@@ -77,12 +77,11 @@ pub fn create_with_600_perms<P: AsRef<Path>>(path: P, bytes: &[u8]) -> Result<()
 }
 
 /// Generates a random alphanumeric password of length `DEFAULT_PASSWORD_LEN`.
-pub fn random_password() -> PlainText {
+pub fn random_password() -> ZeroizeString {
     rand::thread_rng()
         .sample_iter(&Alphanumeric)
         .take(DEFAULT_PASSWORD_LEN)
         .collect::<String>()
-        .into_bytes()
         .into()
 }
 

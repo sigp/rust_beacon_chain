@@ -1,7 +1,7 @@
 use crate::ValidatorStore;
 use account_utils::{
     eth2_wallet::{bip39::Mnemonic, WalletBuilder},
-    random_mnemonic, random_password, ZeroizeString,
+    random_mnemonic, random_password,
 };
 use eth2::lighthouse_vc::types::{self as api_types};
 use slot_clock::SlotClock;
@@ -33,7 +33,7 @@ pub async fn create_validators<P: AsRef<Path>, T: 'static + SlotClock, E: EthSpe
 
     let wallet_password = random_password();
     let mut wallet =
-        WalletBuilder::from_mnemonic(&mnemonic, wallet_password.as_bytes(), String::new())
+        WalletBuilder::from_mnemonic(&mnemonic, wallet_password.as_ref(), String::new())
             .and_then(|builder| builder.build())
             .map_err(|e| {
                 warp_utils::reject::custom_server_error(format!(
@@ -56,20 +56,13 @@ pub async fn create_validators<P: AsRef<Path>, T: 'static + SlotClock, E: EthSpe
     for request in validator_requests {
         let voting_password = random_password();
         let withdrawal_password = random_password();
-        let voting_password_string = ZeroizeString::from(
-            String::from_utf8(voting_password.as_bytes().to_vec()).map_err(|e| {
-                warp_utils::reject::custom_server_error(format!(
-                    "locally generated password is not utf8: {:?}",
-                    e
-                ))
-            })?,
-        );
+        let voting_password_string = voting_password.clone();
 
         let mut keystores = wallet
             .next_validator(
-                wallet_password.as_bytes(),
-                voting_password.as_bytes(),
-                withdrawal_password.as_bytes(),
+                wallet_password.as_ref(),
+                voting_password.as_ref(),
+                withdrawal_password.as_ref(),
             )
             .map_err(|e| {
                 warp_utils::reject::custom_server_error(format!(
@@ -95,8 +88,8 @@ pub async fn create_validators<P: AsRef<Path>, T: 'static + SlotClock, E: EthSpe
             })?;
 
         let validator_dir = ValidatorDirBuilder::new(validator_dir.as_ref().into())
-            .voting_keystore(keystores.voting, voting_password.as_bytes())
-            .withdrawal_keystore(keystores.withdrawal, withdrawal_password.as_bytes())
+            .voting_keystore(keystores.voting, voting_password.as_ref())
+            .withdrawal_keystore(keystores.withdrawal, withdrawal_password.as_ref())
             .create_eth1_tx_data(request.deposit_gwei, &spec)
             .store_withdrawal_keystore(false)
             .build()
