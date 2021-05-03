@@ -491,6 +491,9 @@ impl<T: BeaconChainTypes> GossipVerifiedBlock<T> {
 
         let block_root = get_block_root(&block);
 
+        // Disallow blocks that conflict with the anchor (weak subjectivity checkpoint), if any.
+        check_block_against_anchor_slot(&block.message, chain)?;
+
         // Do not gossip a block from a finalized slot.
         check_block_against_finalized_slot(&block.message, chain)?;
 
@@ -692,6 +695,9 @@ impl<T: BeaconChainTypes> SignatureVerifiedBlock<T> {
         block: SignedBeaconBlock<T::EthSpec>,
         chain: &BeaconChain<T>,
     ) -> Result<Self, BlockError<T::EthSpec>> {
+        // Check the anchor slot before loading the parent, to avoid spurious lookups.
+        check_block_against_anchor_slot(&block.message, chain)?;
+
         let (mut parent, block) = load_parent(block, chain)?;
 
         // Reject any block that exceeds our limit on skipped slots.
@@ -1078,6 +1084,19 @@ fn check_block_skip_slots<T: BeaconChainTypes>(
         }
     }
 
+    Ok(())
+}
+
+/// Returns `Ok(())` if the block's slot is greater than the anchor block's slot (if any).
+fn check_block_against_anchor_slot<T: BeaconChainTypes>(
+    block: &BeaconBlock<T::EthSpec>,
+    chain: &BeaconChain<T>,
+) -> Result<(), BlockError<T::EthSpec>> {
+    if let Some(anchor_slot) = chain.store.get_anchor_slot() {
+        if block.slot <= anchor_slot {
+            return Err(BlockError::WeakSubjectivityConflict);
+        }
+    }
     Ok(())
 }
 

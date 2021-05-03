@@ -24,10 +24,10 @@ use slot_clock::{SlotClock, TestingSlotClock};
 use std::marker::PhantomData;
 use std::sync::Arc;
 use std::time::Duration;
-use store::{HotColdDB, ItemStore};
+use store::{AnchorInfo, HotColdDB, ItemStore};
 use types::{
-    BeaconBlock, BeaconState, ChainSpec, EthSpec, Graffiti, Hash256, PublicKeyBytes, Signature,
-    SignedBeaconBlock, Slot,
+    BeaconBlock, BeaconState, ChainSpec, Checkpoint, EthSpec, Graffiti, Hash256, PublicKeyBytes,
+    Signature, SignedBeaconBlock, Slot,
 };
 
 /// An empty struct used to "witness" all the `BeaconChainTypes` traits. It has no user-facing
@@ -241,7 +241,7 @@ where
         let genesis_state = store
             .get_state(&genesis_block.state_root(), Some(genesis_block.slot()))
             .map_err(|e| format!("DB error when reading genesis state: {:?}", e))?
-            .ok_or("Genesis block not found in store")?;
+            .ok_or("Genesis state not found in store")?;
 
         self.genesis_time = Some(genesis_state.genesis_time);
 
@@ -268,12 +268,19 @@ where
         Ok(self)
     }
 
-    /// Starts a new chain from a genesis state.
-    pub fn genesis_state(
+    /// Store the genesis state & block in the DB, and derive
+    ///
+    /// Do *not* initialize fork choice, or do anything that assumes starting from genesis.
+    ///
+    /// Return the `BeaconSnapshot` representing genesis as well as the mutated builder.
+    fn set_genesis_state(
         mut self,
         mut beacon_state: BeaconState<TEthSpec>,
-    ) -> Result<Self, String> {
-        let store = self.store.clone().ok_or("genesis_state requires a store")?;
+    ) -> Result<(BeaconSnapshot<TEthSpec>, Self), String> {
+        let store = self
+            .store
+            .clone()
+            .ok_or("set_genesis_state requires a store")?;
 
         let beacon_block = genesis_block(&mut beacon_state, &self.spec)?;
 
@@ -283,9 +290,6 @@ where
 
         let beacon_state_root = beacon_block.message.state_root;
         let beacon_block_root = beacon_block.canonical_root();
-
-        self.genesis_state_root = Some(beacon_state_root);
-        self.genesis_block_root = Some(beacon_block_root);
 
         store
             .put_state(&beacon_state_root, &beacon_state)
@@ -304,11 +308,26 @@ where
                 )
             })?;
 
-        let genesis = BeaconSnapshot {
-            beacon_block_root,
-            beacon_block,
-            beacon_state,
-        };
+        self.genesis_state_root = Some(beacon_state_root);
+        self.genesis_block_root = Some(beacon_block_root);
+        self.genesis_time = Some(beacon_state.genesis_time);
+
+        Ok((
+            BeaconSnapshot {
+                beacon_block_root,
+                beacon_block,
+                beacon_state,
+            },
+            self,
+        ))
+    }
+
+    /// Starts a new chain from a genesis state.
+    pub fn genesis_state(mut self, beacon_state: BeaconState<TEthSpec>) -> Result<Self, String> {
+        let store = self.store.clone().ok_or("genesis_state requires a store")?;
+
+        let (genesis, updated_builder) = self.set_genesis_state(beacon_state)?;
+        self = updated_builder;
 
         let fc_store = BeaconForkChoiceStore::get_forkchoice_store(store, &genesis);
 
@@ -318,10 +337,75 @@ where
             &genesis.beacon_block.message,
             &genesis.beacon_state,
         )
-        .map_err(|e| format!("Unable to build initialize ForkChoice: {:?}", e))?;
+        .map_err(|e| format!("Unable to initialize ForkChoice: {:?}", e))?;
 
         self.fork_choice = Some(fork_choice);
-        self.genesis_time = Some(genesis.beacon_state.genesis_time);
+
+        Ok(self.empty_op_pool())
+    }
+
+    /// Start the chain from a weak subjectivity state.
+    pub fn weak_subjectivity_state(
+        mut self,
+        weak_subj_state: BeaconState<TEthSpec>,
+        weak_subj_block: SignedBeaconBlock<TEthSpec>,
+        genesis_state: BeaconState<TEthSpec>,
+    ) -> Result<Self, String> {
+        let store = self.store.clone().ok_or("genesis_state requires a store")?;
+
+        let weak_subj_slot = weak_subj_state.slot;
+        let weak_subj_block_root = weak_subj_block.canonical_root();
+        let weak_subj_state_root = weak_subj_block.state_root();
+
+        // Set the store's split point *before* storing genesis so that genesis is stored
+        // immediately in the freezer DB.
+        store.set_split(weak_subj_slot, weak_subj_state_root);
+        store
+            .store_split()
+            .map_err(|e| format!("Error storing DB split point: {:?}", e))?;
+
+        let (_, updated_builder) = self.set_genesis_state(genesis_state)?;
+        self = updated_builder;
+
+        store
+            .put_state(&weak_subj_state_root, &weak_subj_state)
+            .map_err(|e| format!("Failed to store weak subjectivity state: {:?}", e))?;
+        store
+            .put_item(&weak_subj_block_root, &weak_subj_block)
+            .map_err(|e| format!("Failed to store weak subjectivity block: {:?}", e))?;
+
+        // Store anchor info (context for weak subj sync).
+        let anchor_info =
+            AnchorInfo::new(weak_subj_state.slot, weak_subj_block.message.parent_root);
+        store
+            .compare_and_set_anchor_info(None, Some(anchor_info))
+            .map_err(|e| format!("Error setting anchor: {:?}", e))?;
+
+        // Store pruning checkpoint to prevent attempting to prune before the anchor state.
+        store
+            .store_pruning_checkpoint(Checkpoint {
+                root: weak_subj_block_root,
+                epoch: weak_subj_state.slot.epoch(TEthSpec::slots_per_epoch()),
+            })
+            .map_err(|e| format!("Failed to write pruning checkpoint: {:?}", e))?;
+
+        let snapshot = BeaconSnapshot {
+            beacon_block_root: weak_subj_block_root,
+            beacon_block: weak_subj_block,
+            beacon_state: weak_subj_state,
+        };
+
+        let fc_store = BeaconForkChoiceStore::get_forkchoice_store(store, &snapshot);
+
+        let fork_choice = ForkChoice::from_genesis(
+            fc_store,
+            snapshot.beacon_block_root,
+            &snapshot.beacon_block.message,
+            &snapshot.beacon_state,
+        )
+        .map_err(|e| format!("Unable to initialize ForkChoice: {:?}", e))?;
+
+        self.fork_choice = Some(fork_choice);
 
         Ok(self.empty_op_pool())
     }
@@ -461,12 +545,13 @@ where
         let fc_finalized = fork_choice.finalized_checkpoint();
         let head_finalized = canonical_head.beacon_state.finalized_checkpoint;
         if fc_finalized != head_finalized {
-            if head_finalized.root == Hash256::zero()
+            let is_genesis = head_finalized.root.is_zero()
                 && head_finalized.epoch == fc_finalized.epoch
-                && fc_finalized.root == genesis_block_root
-            {
-                // This is a legal edge-case encountered during genesis.
-            } else {
+                && fc_finalized.root == genesis_block_root;
+            let is_wss = store.get_anchor_slot().map_or(false, |anchor_slot| {
+                fc_finalized.epoch == anchor_slot.epoch(TEthSpec::slots_per_epoch())
+            });
+            if !is_genesis && !is_wss {
                 return Err(format!(
                     "Database corrupt: fork choice is finalized at {:?} whilst head is finalized at \
                     {:?}",

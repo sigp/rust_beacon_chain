@@ -1,10 +1,15 @@
 #![cfg(not(debug_assertions))]
 
 use beacon_chain::attestation_verification::Error as AttnError;
+use beacon_chain::builder::BeaconChainBuilder;
 use beacon_chain::test_utils::{
     test_logger, AttestationStrategy, BeaconChainHarness, BlockStrategy, DiskHarnessType,
+    HARNESS_SLOT_TIME,
 };
-use beacon_chain::BeaconSnapshot;
+use beacon_chain::{
+    historical_blocks::HistoricalBlockError, migrate::MigratorConfig, BeaconChainError,
+    BeaconSnapshot, ChainConfig, ServerSentEventHandler,
+};
 use lazy_static::lazy_static;
 use maplit::hashset;
 use rand::Rng;
@@ -542,7 +547,7 @@ fn multiple_attestations_per_block() {
     let harness = get_harness(store, HIGH_VALIDATOR_COUNT);
 
     harness.extend_chain(
-        MainnetEthSpec::slots_per_epoch() as usize * 3,
+        E::slots_per_epoch() as usize * 3,
         BlockStrategy::OnCanonicalHead,
         AttestationStrategy::AllValidators,
     );
@@ -1718,6 +1723,126 @@ fn garbage_collect_temp_states_from_failed_block() {
     // On startup, the store should garbage collect all the temporary states.
     let store = get_store(&db_path);
     assert_eq!(store.iter_temporary_state_roots().count(), 0);
+}
+
+#[test]
+fn weak_subjectivity_sync() {
+    // Build an initial chain on one harness, representing a synced node with full history.
+    let num_initial_blocks = E::slots_per_epoch() * 11;
+    let num_final_blocks = E::slots_per_epoch() * 2;
+
+    let temp1 = tempdir().unwrap();
+    let full_store = get_store(&temp1);
+    let harness = get_harness(full_store.clone(), LOW_VALIDATOR_COUNT);
+
+    harness.extend_chain(
+        num_initial_blocks as usize,
+        BlockStrategy::OnCanonicalHead,
+        AttestationStrategy::AllValidators,
+    );
+
+    let genesis_state = full_store
+        .get_state(&harness.chain.genesis_state_root, Some(Slot::new(0)))
+        .unwrap()
+        .unwrap();
+    let wss_checkpoint = harness.chain.head_info().unwrap().finalized_checkpoint;
+    let wss_block = harness.get_block(wss_checkpoint.root.into()).unwrap();
+    let wss_state = full_store
+        .get_state(&wss_block.state_root(), None)
+        .unwrap()
+        .unwrap();
+    let wss_slot = wss_block.slot();
+
+    // Add more blocks that advance finalization further.
+    harness.advance_slot();
+    harness.extend_chain(
+        num_final_blocks as usize,
+        BlockStrategy::OnCanonicalHead,
+        AttestationStrategy::AllValidators,
+    );
+
+    let (shutdown_tx, _shutdown_rx) = futures::channel::mpsc::channel(1);
+    let log = test_logger();
+    let temp2 = tempdir().unwrap();
+    let data_dir = tempdir().unwrap();
+    let store = get_store(&temp2);
+
+    // Initialise a new beacon chain from the finalized checkpoint
+    let beacon_chain = BeaconChainBuilder::new(MinimalEthSpec)
+        .store(store.clone())
+        .weak_subjectivity_state(wss_state, wss_block.clone(), genesis_state)
+        .unwrap()
+        .logger(log.clone())
+        .store_migrator_config(MigratorConfig::default().blocking())
+        .data_dir(data_dir.path().to_path_buf())
+        .dummy_eth1_backend()
+        .expect("should build dummy backend")
+        .testing_slot_clock(HARNESS_SLOT_TIME)
+        .expect("should configure testing slot clock")
+        .shutdown_sender(shutdown_tx)
+        .chain_config(ChainConfig::default())
+        .event_handler(Some(ServerSentEventHandler::new_with_capacity(
+            log.clone(),
+            1,
+        )))
+        .monitor_validators(true, vec![], log)
+        .build()
+        .expect("should build");
+
+    // Apply blocks forward to reach head.
+    let chain_dump = harness.chain.chain_dump().unwrap();
+    let new_blocks = &chain_dump[wss_slot.as_usize() + 1..];
+
+    assert_eq!(new_blocks[0].beacon_block.slot(), wss_slot + 1);
+
+    for snapshot in new_blocks {
+        beacon_chain
+            .slot_clock
+            .set_slot(snapshot.beacon_block.slot().as_u64());
+        beacon_chain
+            .process_block(snapshot.beacon_block.clone())
+            .unwrap();
+        beacon_chain.fork_choice().unwrap();
+    }
+
+    // Forwards iterator from 0 should fail as we lack blocks.
+    assert!(matches!(
+        beacon_chain.forwards_iter_block_roots(Slot::new(0)),
+        Err(BeaconChainError::HistoricalBlockError(
+            HistoricalBlockError::BlockOutOfRange { .. }
+        ))
+    ));
+
+    // Simulate processing of a `StatusMessage` with an older finalized epoch by calling
+    // `root_at_slot` with an old slot for which we don't know the block root. It should
+    // return `None` rather than erroring.
+    assert_eq!(beacon_chain.root_at_slot(Slot::new(1)).unwrap(), None);
+
+    // Supply blocks backwards to reach genesis
+    let historical_blocks = chain_dump[..wss_block.slot().as_usize()]
+        .iter()
+        .map(|s| s.beacon_block.clone())
+        .collect::<Vec<_>>();
+    beacon_chain
+        .import_historical_block_batch(historical_blocks.clone())
+        .unwrap();
+    assert_eq!(beacon_chain.store.get_oldest_block_slot(), 0);
+
+    // Resupplying the blocks should fail
+    beacon_chain
+        .import_historical_block_batch(historical_blocks)
+        .unwrap_err();
+
+    // The forwards iterator should now match the original chain
+    assert!(beacon_chain
+        .forwards_iter_block_roots(Slot::new(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .eq(harness
+            .chain
+            .forwards_iter_block_roots(Slot::new(0))
+            .unwrap()
+            .map(Result::unwrap)));
 }
 
 /// Check that the head state's slot matches `expected_slot`.

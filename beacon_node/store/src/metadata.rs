@@ -1,8 +1,9 @@
 use crate::{DBColumn, Error, StoreItem};
 use ssz::{Decode, Encode};
-use types::{Checkpoint, Hash256};
+use ssz_derive::{Decode, Encode};
+use types::{Checkpoint, Hash256, Slot};
 
-pub const CURRENT_SCHEMA_VERSION: SchemaVersion = SchemaVersion(3);
+pub const CURRENT_SCHEMA_VERSION: SchemaVersion = SchemaVersion(4);
 
 // All the keys that get stored under the `BeaconMeta` column.
 //
@@ -12,6 +13,7 @@ pub const CONFIG_KEY: Hash256 = Hash256::repeat_byte(1);
 pub const SPLIT_KEY: Hash256 = Hash256::repeat_byte(2);
 pub const PRUNING_CHECKPOINT_KEY: Hash256 = Hash256::repeat_byte(3);
 pub const COMPACTION_TIMESTAMP_KEY: Hash256 = Hash256::repeat_byte(4);
+pub const ANCHOR_INFO_KEY: Hash256 = Hash256::repeat_byte(5);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct SchemaVersion(pub u64);
@@ -74,5 +76,45 @@ impl StoreItem for CompactionTimestamp {
 
     fn from_store_bytes(bytes: &[u8]) -> Result<Self, Error> {
         Ok(CompactionTimestamp(u64::from_ssz_bytes(bytes)?))
+    }
+}
+
+/// Database parameters relevant to weak subjectivity sync.
+#[derive(Debug, PartialEq, Eq, Clone, Encode, Decode)]
+pub struct AnchorInfo {
+    /// The slot at which the anchor state is present and which we cannot revert.
+    pub anchor_slot: Slot,
+    /// The slot from which historical blocks are available (>=).
+    pub oldest_block_slot: Slot,
+    /// The block root of the next block that needs to be added to fill in the history.
+    ///
+    /// Zero if we know all blocks back to genesis.
+    pub oldest_block_parent: Hash256,
+    /// The slot from which historical states are available (>=).
+    pub oldest_state_slot: Slot,
+}
+
+impl AnchorInfo {
+    pub fn new(anchor_slot: Slot, anchor_block_parent: Hash256) -> Self {
+        AnchorInfo {
+            anchor_slot,
+            oldest_block_slot: anchor_slot,
+            oldest_block_parent: anchor_block_parent,
+            oldest_state_slot: anchor_slot,
+        }
+    }
+}
+
+impl StoreItem for AnchorInfo {
+    fn db_column() -> DBColumn {
+        DBColumn::BeaconMeta
+    }
+
+    fn as_store_bytes(&self) -> Vec<u8> {
+        self.as_ssz_bytes()
+    }
+
+    fn from_store_bytes(bytes: &[u8]) -> Result<Self, Error> {
+        Ok(Self::from_ssz_bytes(bytes)?)
     }
 }
