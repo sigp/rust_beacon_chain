@@ -44,7 +44,8 @@ use eth2_libp2p::{
 };
 use futures::stream::{Stream, StreamExt};
 use futures::task::Poll;
-use slog::{debug, error, trace, warn, Logger};
+use slog::{crit, debug, error, trace, warn, Logger};
+use std::cmp;
 use std::collections::VecDeque;
 use std::fmt;
 use std::pin::Pin;
@@ -64,7 +65,7 @@ mod block_delay_queue;
 mod tests;
 mod worker;
 
-pub use worker::ProcessId;
+pub use worker::{GossipAggregatePackage, GossipAttestationPackage, ProcessId};
 
 /// The maximum size of the channel for work events to the `BeaconProcessor`.
 ///
@@ -133,11 +134,16 @@ const WORKER_TASK_NAME: &str = "beacon_processor_worker";
 /// The minimum interval between log messages indicating that a queue is full.
 const LOG_DEBOUNCE_INTERVAL: Duration = Duration::from_secs(30);
 
+const MAX_GOSSIP_ATTESTATION_BATCH_SIZE: usize = 32;
+const MAX_GOSSIP_AGGREGATE_BATCH_SIZE: usize = 16;
+
 /// Unique IDs used for metrics and testing.
 pub const WORKER_FREED: &str = "worker_freed";
 pub const NOTHING_TO_DO: &str = "nothing_to_do";
 pub const GOSSIP_ATTESTATION: &str = "gossip_attestation";
+pub const GOSSIP_ATTESTATION_BATCH: &str = "gossip_attestation_batch";
 pub const GOSSIP_AGGREGATE: &str = "gossip_aggregate";
+pub const GOSSIP_AGGREGATE_BATCH: &str = "gossip_aggregate_batch";
 pub const GOSSIP_BLOCK: &str = "gossip_block";
 pub const DELAYED_IMPORT_BLOCK: &str = "delayed_import_block";
 pub const GOSSIP_VOLUNTARY_EXIT: &str = "gossip_voluntary_exit";
@@ -453,11 +459,17 @@ pub enum Work<T: BeaconChainTypes> {
         should_import: bool,
         seen_timestamp: Duration,
     },
+    GossipAttestationBatch {
+        packages: Vec<GossipAttestationPackage<T::EthSpec>>,
+    },
     GossipAggregate {
         message_id: MessageId,
         peer_id: PeerId,
         aggregate: Box<SignedAggregateAndProof<T::EthSpec>>,
         seen_timestamp: Duration,
+    },
+    GossipAggregateBatch {
+        packages: Vec<GossipAggregatePackage<T::EthSpec>>,
     },
     GossipBlock {
         message_id: MessageId,
@@ -514,7 +526,9 @@ impl<T: BeaconChainTypes> Work<T> {
     fn str_id(&self) -> &'static str {
         match self {
             Work::GossipAttestation { .. } => GOSSIP_ATTESTATION,
+            Work::GossipAttestationBatch { .. } => GOSSIP_ATTESTATION_BATCH,
             Work::GossipAggregate { .. } => GOSSIP_AGGREGATE,
+            Work::GossipAggregateBatch { .. } => GOSSIP_AGGREGATE_BATCH,
             Work::GossipBlock { .. } => GOSSIP_BLOCK,
             Work::DelayedImportBlock { .. } => DELAYED_IMPORT_BLOCK,
             Work::GossipVoluntaryExit { .. } => GOSSIP_VOLUNTARY_EXIT,
@@ -788,10 +802,101 @@ impl<T: BeaconChainTypes> BeaconProcessor<T> {
                         // Check the aggregates, *then* the unaggregates since we assume that
                         // aggregates are more valuable to local validators and effectively give us
                         // more information with less signature verification time.
-                        } else if let Some(item) = aggregate_queue.pop() {
-                            self.spawn_worker(item, toolbox);
-                        } else if let Some(item) = attestation_queue.pop() {
-                            self.spawn_worker(item, toolbox);
+                        } else if aggregate_queue.len() > 0 {
+                            let batch_size =
+                                cmp::min(aggregate_queue.len(), MAX_GOSSIP_AGGREGATE_BATCH_SIZE);
+
+                            if batch_size < 2 {
+                                // One single aggregate is in the queue, process it individually.
+                                if let Some(item) = aggregate_queue.pop() {
+                                    self.spawn_worker(item, toolbox);
+                                }
+                            } else {
+                                // Collect two or more aggregates into a batch, so they can take
+                                // advantage of batch signature verification.
+                                //
+                                // Note: this will convert the `Work::GossipAggregate` item into a
+                                // `Work::GossipAggregateBatch` item.
+                                let mut packages = Vec::with_capacity(batch_size);
+                                for _ in 0..batch_size {
+                                    if let Some(item) = aggregate_queue.pop() {
+                                        match item {
+                                            Work::GossipAggregate {
+                                                message_id,
+                                                peer_id,
+                                                aggregate,
+                                                seen_timestamp,
+                                            } => {
+                                                packages.push(GossipAggregatePackage::new(
+                                                    message_id,
+                                                    peer_id,
+                                                    aggregate,
+                                                    seen_timestamp,
+                                                ));
+                                            }
+                                            _ => {
+                                                error!(self.log, "Invalid item in aggregate queue")
+                                            }
+                                        }
+                                    }
+                                }
+
+                                self.spawn_worker(Work::GossipAggregateBatch { packages }, toolbox)
+                            }
+                        // Check the unaggregated attestation queue.
+                        //
+                        // Potentially use batching.
+                        } else if attestation_queue.len() > 0 {
+                            let batch_size = cmp::min(
+                                attestation_queue.len(),
+                                MAX_GOSSIP_ATTESTATION_BATCH_SIZE,
+                            );
+
+                            if batch_size < 2 {
+                                // One single attestation is in the queue, process it individually.
+                                if let Some(item) = attestation_queue.pop() {
+                                    self.spawn_worker(item, toolbox);
+                                }
+                            } else {
+                                // Collect two or more attestations into a batch, so they can take
+                                // advantage of batch signature verification.
+                                //
+                                // Note: this will convert the `Work::GossipAttestation` item into a
+                                // `Work::GossipAttestationBatch` item.
+                                let mut packages = Vec::with_capacity(batch_size);
+                                for _ in 0..batch_size {
+                                    if let Some(item) = attestation_queue.pop() {
+                                        match item {
+                                            Work::GossipAttestation {
+                                                message_id,
+                                                peer_id,
+                                                attestation,
+                                                subnet_id,
+                                                should_import,
+                                                seen_timestamp,
+                                            } => {
+                                                packages.push(GossipAttestationPackage::new(
+                                                    message_id,
+                                                    peer_id,
+                                                    attestation,
+                                                    subnet_id,
+                                                    should_import,
+                                                    seen_timestamp,
+                                                ));
+                                            }
+                                            _ => error!(
+                                                self.log,
+                                                "Invalid item in attestation queue"
+                                            ),
+                                        }
+                                    }
+                                }
+
+                                self.spawn_worker(
+                                    Work::GossipAttestationBatch { packages },
+                                    toolbox,
+                                )
+                            }
                         // Check RPC methods next. Status messages are needed for sync so
                         // prioritize them over syncing requests from other peers (BlocksByRange
                         // and BlocksByRoot)
@@ -863,7 +968,17 @@ impl<T: BeaconChainTypes> BeaconProcessor<T> {
                         match work {
                             _ if can_spawn => self.spawn_worker(work, toolbox),
                             Work::GossipAttestation { .. } => attestation_queue.push(work),
+                            Work::GossipAttestationBatch { .. } => crit!(
+                                    self.log,
+                                    "Unsupported inbound event";
+                                    "type" => "GossipAttestationBatch"
+                            ),
                             Work::GossipAggregate { .. } => aggregate_queue.push(work),
+                            Work::GossipAggregateBatch { .. } => crit!(
+                                    self.log,
+                                    "Unsupported inbound event";
+                                    "type" => "GossipAggregateBatch"
+                            ),
                             Work::GossipBlock { .. } => {
                                 gossip_block_queue.push(work, work_id, &self.log)
                             }
@@ -1033,6 +1148,9 @@ impl<T: BeaconChainTypes> BeaconProcessor<T> {
                         should_import,
                         seen_timestamp,
                     ),
+                    Work::GossipAttestationBatch { packages } => {
+                        worker.process_gossip_attestation_batch(packages)
+                    }
                     /*
                      * Aggregated attestation verification.
                      */
@@ -1047,6 +1165,9 @@ impl<T: BeaconChainTypes> BeaconProcessor<T> {
                         *aggregate,
                         seen_timestamp,
                     ),
+                    Work::GossipAggregateBatch { packages } => {
+                        worker.process_gossip_aggregate_batch(packages)
+                    }
                     /*
                      * Verification for beacon blocks received on gossip.
                      */
