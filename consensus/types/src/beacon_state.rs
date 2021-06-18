@@ -15,7 +15,7 @@ use ssz_derive::{Decode, Encode};
 use ssz_types::{typenum::Unsigned, BitVector, FixedVector};
 use std::collections::HashSet;
 use std::convert::TryInto;
-use std::{fmt, mem};
+use std::{fmt, mem, sync::Arc};
 use superstruct::superstruct;
 use swap_or_not_shuffle::compute_shuffled_index;
 use test_random_derive::TestRandom;
@@ -25,12 +25,14 @@ use tree_hash_derive::TreeHash;
 pub use self::committee_cache::CommitteeCache;
 pub use clone_config::CloneConfig;
 pub use eth_spec::*;
+pub use iter::BlockRootsIter;
 pub use tree_hash_cache::BeaconTreeHashCache;
 
 #[macro_use]
 mod committee_cache;
 mod clone_config;
 mod exit_cache;
+mod iter;
 mod pubkey_cache;
 mod tests;
 mod tree_hash_cache;
@@ -253,9 +255,9 @@ where
 
     // Light-client sync committees
     #[superstruct(only(Altair))]
-    pub current_sync_committee: SyncCommittee<T>,
+    pub current_sync_committee: Arc<SyncCommittee<T>>,
     #[superstruct(only(Altair))]
-    pub next_sync_committee: SyncCommittee<T>,
+    pub next_sync_committee: Arc<SyncCommittee<T>>,
 
     // Caching (not in the spec)
     #[serde(skip_serializing, skip_deserializing)]
@@ -828,6 +830,13 @@ impl<T: EthSpec> BeaconState<T> {
         } else {
             Err(BeaconStateError::SlotOutOfBounds)
         }
+    }
+
+    /// Returns an iterator across the past block roots of `state` in descending slot-order.
+    ///
+    /// See the docs for `BlockRootsIter` for more detail.
+    pub fn rev_iter_block_roots<'a>(&'a self, spec: &ChainSpec) -> BlockRootsIter<'a, T> {
+        BlockRootsIter::new(self, spec.genesis_slot)
     }
 
     /// Return the block root at a recent `slot`.
@@ -1504,6 +1513,28 @@ impl<T: EthSpec> BeaconState<T> {
     pub fn is_in_inactivity_leak(&self, spec: &ChainSpec) -> bool {
         (self.previous_epoch() - self.finalized_checkpoint().epoch)
             > spec.min_epochs_to_inactivity_penalty
+    }
+
+    /// Get the `SyncCommittee` associated with the next slot. Useful because sync committees
+    /// assigned to `slot` sign for `slot - 1`. This creates the exceptional logic below when
+    /// transitioning between sync committee periods.
+    pub fn get_sync_committee_for_next_slot(
+        &self,
+        spec: &ChainSpec,
+    ) -> Result<Arc<SyncCommittee<T>>, Error> {
+        let next_slot_epoch = self
+            .slot()
+            .saturating_add(Slot::new(1))
+            .epoch(T::slots_per_epoch());
+
+        let sync_committee = if self.current_epoch().sync_committee_period(spec)
+            == next_slot_epoch.sync_committee_period(spec)
+        {
+            self.current_sync_committee()?.clone()
+        } else {
+            self.next_sync_committee()?.clone()
+        };
+        Ok(sync_committee)
     }
 }
 

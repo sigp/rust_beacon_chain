@@ -4480,6 +4480,7 @@ name = "operation_pool"
 version = "0.2.0"
 dependencies = [
  "beacon_chain",
+ "derivative",
  "eth2_ssz",
  "eth2_ssz_derive",
  "int_to_bytes",
@@ -4493,6 +4494,7 @@ dependencies = [
  "serde_derive",
  "state_processing",
  "store",
+ "superstruct",
  "types",
 ]
 

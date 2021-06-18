@@ -15,41 +15,44 @@ use libp2p::{Multiaddr, PeerId};
 use rate_limiter::{RPCRateLimiter as RateLimiter, RPCRateLimiterBuilder, RateLimitedErr};
 use slog::{crit, debug, o};
 use std::marker::PhantomData;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
-use types::EthSpec;
+use types::{EthSpec, ForkContext};
 
 pub(crate) use handler::HandlerErr;
 pub(crate) use methods::{MetaData, Ping, RPCCodedResponse, RPCResponse};
-pub(crate) use protocol::{RPCProtocol, RPCRequest};
+pub(crate) use protocol::{InboundRequest, RPCProtocol};
 
 pub use handler::SubstreamId;
 pub use methods::{
     BlocksByRangeRequest, BlocksByRootRequest, GoodbyeReason, MaxRequestBlocks,
     RPCResponseErrorCode, RequestId, ResponseTermination, StatusMessage, MAX_REQUEST_BLOCKS,
 };
+pub(crate) use outbound::OutboundRequest;
 pub use protocol::{Protocol, RPCError};
 
 pub(crate) mod codec;
 mod handler;
 pub mod methods;
+mod outbound;
 mod protocol;
 mod rate_limiter;
 
 /// RPC events sent from Lighthouse.
 #[derive(Debug, Clone)]
-pub enum RPCSend<T: EthSpec> {
+pub enum RPCSend<TSpec: EthSpec> {
     /// A request sent from Lighthouse.
     ///
     /// The `RequestId` is given by the application making the request. These
     /// go over *outbound* connections.
-    Request(RequestId, RPCRequest<T>),
+    Request(RequestId, OutboundRequest<TSpec>),
     /// A response sent from Lighthouse.
     ///
     /// The `SubstreamId` must correspond to the RPC-given ID of the original request received from the
     /// peer. The second parameter is a single chunk of a response. These go over *inbound*
     /// connections.
-    Response(SubstreamId, RPCCodedResponse<T>),
+    Response(SubstreamId, RPCCodedResponse<TSpec>),
 }
 
 /// RPC events received from outside Lighthouse.
@@ -59,7 +62,7 @@ pub enum RPCReceived<T: EthSpec> {
     ///
     /// The `SubstreamId` is given by the `RPCHandler` as it identifies this request with the
     /// *inbound* substream over which it is managed.
-    Request(SubstreamId, RPCRequest<T>),
+    Request(SubstreamId, InboundRequest<T>),
     /// A response received from the outside.
     ///
     /// The `RequestId` corresponds to the application given ID of the original request sent to the
@@ -96,12 +99,13 @@ pub struct RPC<TSpec: EthSpec> {
     limiter: RateLimiter,
     /// Queue of events to be processed.
     events: Vec<NetworkBehaviourAction<RPCSend<TSpec>, RPCMessage<TSpec>>>,
+    fork_context: Arc<ForkContext>,
     /// Slog logger for RPC behaviour.
     log: slog::Logger,
 }
 
 impl<TSpec: EthSpec> RPC<TSpec> {
-    pub fn new(log: slog::Logger) -> Self {
+    pub fn new(fork_context: Arc<ForkContext>, log: slog::Logger) -> Self {
         let log = log.new(o!("service" => "libp2p_rpc"));
         let limiter = RPCRateLimiterBuilder::new()
             .n_every(Protocol::MetaData, 2, Duration::from_secs(5))
@@ -123,6 +127,7 @@ impl<TSpec: EthSpec> RPC<TSpec> {
         RPC {
             limiter,
             events: Vec::new(),
+            fork_context,
             log,
         }
     }
@@ -150,7 +155,7 @@ impl<TSpec: EthSpec> RPC<TSpec> {
         &mut self,
         peer_id: PeerId,
         request_id: RequestId,
-        event: RPCRequest<TSpec>,
+        event: OutboundRequest<TSpec>,
     ) {
         self.events.push(NetworkBehaviourAction::NotifyHandler {
             peer_id,
@@ -171,10 +176,12 @@ where
         RPCHandler::new(
             SubstreamProtocol::new(
                 RPCProtocol {
+                    fork_context: self.fork_context.clone(),
                     phantom: PhantomData,
                 },
                 (),
             ),
+            self.fork_context.clone(),
             &self.log,
         )
     }
@@ -188,7 +195,8 @@ where
     fn inject_connected(&mut self, peer_id: &PeerId) {
         // find the peer's meta-data
         debug!(self.log, "Requesting new peer's metadata"; "peer_id" => %peer_id);
-        let rpc_event = RPCSend::Request(RequestId::Behaviour, RPCRequest::MetaData(PhantomData));
+        let rpc_event =
+            RPCSend::Request(RequestId::Behaviour, OutboundRequest::MetaData(PhantomData));
         self.events.push(NetworkBehaviourAction::NotifyHandler {
             peer_id: *peer_id,
             handler: NotifyHandler::Any,

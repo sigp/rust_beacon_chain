@@ -1,7 +1,7 @@
 //! This handles the various supported encoding mechanism for the Eth 2.0 RPC.
 
 use crate::rpc::methods::ErrorType;
-use crate::rpc::{RPCCodedResponse, RPCRequest, RPCResponse};
+use crate::rpc::{InboundRequest, OutboundRequest, RPCCodedResponse, RPCResponse};
 use libp2p::bytes::BufMut;
 use libp2p::bytes::BytesMut;
 use std::marker::PhantomData;
@@ -47,7 +47,7 @@ where
 // This deals with Decoding RPC Responses from other peers and encoding our requests
 pub struct BaseOutboundCodec<TOutboundCodec, TSpec>
 where
-    TOutboundCodec: OutboundCodec<RPCRequest<TSpec>>,
+    TOutboundCodec: OutboundCodec<OutboundRequest<TSpec>>,
     TSpec: EthSpec,
 {
     /// Inner codec for handling various encodings.
@@ -60,7 +60,7 @@ where
 impl<TOutboundCodec, TSpec> BaseOutboundCodec<TOutboundCodec, TSpec>
 where
     TSpec: EthSpec,
-    TOutboundCodec: OutboundCodec<RPCRequest<TSpec>>,
+    TOutboundCodec: OutboundCodec<OutboundRequest<TSpec>>,
 {
     pub fn new(codec: TOutboundCodec) -> Self {
         BaseOutboundCodec {
@@ -102,9 +102,9 @@ where
 impl<TCodec, TSpec> Decoder for BaseInboundCodec<TCodec, TSpec>
 where
     TSpec: EthSpec,
-    TCodec: Encoder<RPCCodedResponse<TSpec>> + Decoder<Item = RPCRequest<TSpec>>,
+    TCodec: Encoder<RPCCodedResponse<TSpec>> + Decoder<Item = InboundRequest<TSpec>>,
 {
-    type Item = RPCRequest<TSpec>;
+    type Item = InboundRequest<TSpec>;
     type Error = <TCodec as Decoder>::Error;
 
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
@@ -115,14 +115,18 @@ where
 /* Base Outbound Codec */
 
 // This Encodes RPC Requests sent to external peers
-impl<TCodec, TSpec> Encoder<RPCRequest<TSpec>> for BaseOutboundCodec<TCodec, TSpec>
+impl<TCodec, TSpec> Encoder<OutboundRequest<TSpec>> for BaseOutboundCodec<TCodec, TSpec>
 where
     TSpec: EthSpec,
-    TCodec: OutboundCodec<RPCRequest<TSpec>> + Encoder<RPCRequest<TSpec>>,
+    TCodec: OutboundCodec<OutboundRequest<TSpec>> + Encoder<OutboundRequest<TSpec>>,
 {
-    type Error = <TCodec as Encoder<RPCRequest<TSpec>>>::Error;
+    type Error = <TCodec as Encoder<OutboundRequest<TSpec>>>::Error;
 
-    fn encode(&mut self, item: RPCRequest<TSpec>, dst: &mut BytesMut) -> Result<(), Self::Error> {
+    fn encode(
+        &mut self,
+        item: OutboundRequest<TSpec>,
+        dst: &mut BytesMut,
+    ) -> Result<(), Self::Error> {
         self.inner.encode(item, dst)
     }
 }
@@ -131,7 +135,7 @@ where
 impl<TCodec, TSpec> Decoder for BaseOutboundCodec<TCodec, TSpec>
 where
     TSpec: EthSpec,
-    TCodec: OutboundCodec<RPCRequest<TSpec>, CodecErrorType = ErrorType>
+    TCodec: OutboundCodec<OutboundRequest<TSpec>, CodecErrorType = ErrorType>
         + Decoder<Item = RPCResponse<TSpec>>,
 {
     type Item = RPCCodedResponse<TSpec>;
@@ -177,15 +181,17 @@ where
 mod tests {
     use super::super::ssz_snappy::*;
     use super::*;
-    use crate::rpc::methods::StatusMessage;
     use crate::rpc::protocol::*;
-    use snap::write::FrameEncoder;
-    use ssz::Encode;
-    use std::io::Write;
-    use types::{Epoch, Hash256, Slot};
+
+    use std::sync::Arc;
+    use types::{ForkContext, Hash256};
     use unsigned_varint::codec::Uvi;
 
     type Spec = types::MainnetEthSpec;
+
+    fn fork_context() -> ForkContext {
+        ForkContext::new(Hash256::zero(), &Spec::default_spec())
+    }
 
     #[test]
     fn test_decode_status_message() {
@@ -196,8 +202,9 @@ mod tests {
         let snappy_protocol_id =
             ProtocolId::new(Protocol::Status, Version::V1, Encoding::SSZSnappy);
 
+        let fork_context = Arc::new(fork_context());
         let mut snappy_outbound_codec =
-            SSZSnappyOutboundCodec::<Spec>::new(snappy_protocol_id, 1_048_576);
+            SSZSnappyOutboundCodec::<Spec>::new(snappy_protocol_id, 1_048_576, fork_context);
 
         // remove response code
         let mut snappy_buf = buf.clone();
@@ -229,8 +236,10 @@ mod tests {
 
         let snappy_protocol_id =
             ProtocolId::new(Protocol::Status, Version::V1, Encoding::SSZSnappy);
+
+        let fork_context = Arc::new(fork_context());
         let mut snappy_outbound_codec =
-            SSZSnappyOutboundCodec::<Spec>::new(snappy_protocol_id, 1_048_576);
+            SSZSnappyOutboundCodec::<Spec>::new(snappy_protocol_id, 1_048_576, fork_context);
 
         let snappy_decoded_message = snappy_outbound_codec.decode(&mut dst).unwrap_err();
 
@@ -256,80 +265,34 @@ mod tests {
         // Response limits
         let limit = protocol_id.rpc_response_limits::<Spec>();
         let mut max = encode_len(limit.max + 1);
-        let mut codec = SSZSnappyOutboundCodec::<Spec>::new(protocol_id.clone(), 1_048_576);
+        let fork_context = Arc::new(fork_context());
+        let mut codec = SSZSnappyOutboundCodec::<Spec>::new(
+            protocol_id.clone(),
+            1_048_576,
+            fork_context.clone(),
+        );
         assert_eq!(codec.decode(&mut max).unwrap_err(), RPCError::InvalidData);
 
         let mut min = encode_len(limit.min - 1);
-        let mut codec = SSZSnappyOutboundCodec::<Spec>::new(protocol_id.clone(), 1_048_576);
+        let mut codec = SSZSnappyOutboundCodec::<Spec>::new(
+            protocol_id.clone(),
+            1_048_576,
+            fork_context.clone(),
+        );
         assert_eq!(codec.decode(&mut min).unwrap_err(), RPCError::InvalidData);
 
         // Request limits
         let limit = protocol_id.rpc_request_limits();
         let mut max = encode_len(limit.max + 1);
-        let mut codec = SSZSnappyOutboundCodec::<Spec>::new(protocol_id.clone(), 1_048_576);
+        let mut codec = SSZSnappyOutboundCodec::<Spec>::new(
+            protocol_id.clone(),
+            1_048_576,
+            fork_context.clone(),
+        );
         assert_eq!(codec.decode(&mut max).unwrap_err(), RPCError::InvalidData);
 
         let mut min = encode_len(limit.min - 1);
-        let mut codec = SSZSnappyOutboundCodec::<Spec>::new(protocol_id, 1_048_576);
+        let mut codec = SSZSnappyOutboundCodec::<Spec>::new(protocol_id, 1_048_576, fork_context);
         assert_eq!(codec.decode(&mut min).unwrap_err(), RPCError::InvalidData);
-    }
-
-    #[test]
-    fn test_decode_malicious_status_message() {
-        // 10 byte snappy stream identifier
-        let stream_identifier: &'static [u8] = b"\xFF\x06\x00\x00sNaPpY";
-
-        assert_eq!(stream_identifier.len(), 10);
-
-        // byte 0(0xFE) is padding chunk type identifier for snappy messages
-        // byte 1,2,3 are chunk length (little endian)
-        let malicious_padding: &'static [u8] = b"\xFE\x00\x00\x00";
-
-        // Status message is 84 bytes uncompressed. `max_compressed_len` is 32 + 84 + 84/6 = 130.
-        let status_message_bytes = StatusMessage {
-            fork_digest: [0; 4],
-            finalized_root: Hash256::from_low_u64_be(0),
-            finalized_epoch: Epoch::new(1),
-            head_root: Hash256::from_low_u64_be(0),
-            head_slot: Slot::new(1),
-        }
-        .as_ssz_bytes();
-
-        assert_eq!(status_message_bytes.len(), 84);
-        assert_eq!(snap::raw::max_compress_len(status_message_bytes.len()), 130);
-
-        let mut uvi_codec: Uvi<usize> = Uvi::default();
-        let mut dst = BytesMut::with_capacity(1024);
-
-        // Insert length-prefix
-        uvi_codec
-            .encode(status_message_bytes.len(), &mut dst)
-            .unwrap();
-
-        // Insert snappy stream identifier
-        dst.extend_from_slice(stream_identifier);
-
-        // Insert malicious padding of 80 bytes.
-        for _ in 0..20 {
-            dst.extend_from_slice(malicious_padding);
-        }
-
-        // Insert payload (42 bytes compressed)
-        let mut writer = FrameEncoder::new(Vec::new());
-        writer.write_all(&status_message_bytes).unwrap();
-        writer.flush().unwrap();
-        assert_eq!(writer.get_ref().len(), 42);
-        dst.extend_from_slice(writer.get_ref());
-
-        // 10 (for stream identifier) + 80 + 42 = 132 > `max_compressed_len`. Hence, decoding should fail with `InvalidData`.
-
-        let snappy_protocol_id =
-            ProtocolId::new(Protocol::Status, Version::V1, Encoding::SSZSnappy);
-
-        let mut snappy_outbound_codec =
-            SSZSnappyOutboundCodec::<Spec>::new(snappy_protocol_id, 1_048_576);
-
-        let snappy_decoded_message = snappy_outbound_codec.decode(&mut dst).unwrap_err();
-        assert_eq!(snappy_decoded_message, RPCError::InvalidData);
     }
 }

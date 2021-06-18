@@ -14,15 +14,25 @@ use crate::eth1_chain::{Eth1Chain, Eth1ChainBackend};
 use crate::events::ServerSentEventHandler;
 use crate::head_tracker::HeadTracker;
 use crate::migrate::BackgroundMigrator;
-use crate::naive_aggregation_pool::{Error as NaiveAggregationError, NaiveAggregationPool};
-use crate::observed_attestations::{Error as AttestationObservationError, ObservedAttestations};
-use crate::observed_attesters::{ObservedAggregators, ObservedAttesters};
+use crate::naive_aggregation_pool::{
+    AggregatedAttestationMap, Error as NaiveAggregationError, NaiveAggregationPool,
+    SyncContributionAggregateMap,
+};
+use crate::observed_aggregates::{
+    Error as AttestationObservationError, ObservedAggregateAttestations, ObservedSyncContributions,
+};
+use crate::observed_attesters::{
+    ObservedAggregators, ObservedAttesters, ObservedSyncAggregators, ObservedSyncContributors,
+};
 use crate::observed_block_producers::ObservedBlockProducers;
 use crate::observed_operations::{ObservationOutcome, ObservedOperations};
 use crate::persisted_beacon_chain::{PersistedBeaconChain, DUMMY_CANONICAL_HEAD_BLOCK_ROOT};
 use crate::persisted_fork_choice::PersistedForkChoice;
 use crate::shuffling_cache::{BlockShufflingIds, ShufflingCache};
 use crate::snapshot_cache::SnapshotCache;
+use crate::sync_committee_verification::{
+    Error as SyncCommitteeError, VerifiedSyncCommitteeMessage, VerifiedSyncContribution,
+};
 use crate::timeout_rw_lock::TimeoutRwLock;
 use crate::validator_monitor::{
     get_block_delay_ms, get_slot_delay_ms, timestamp_now, ValidatorMonitor,
@@ -32,7 +42,7 @@ use crate::validator_pubkey_cache::ValidatorPubkeyCache;
 use crate::BeaconForkChoiceStore;
 use crate::BeaconSnapshot;
 use crate::{metrics, BeaconChainError};
-use eth2::types::{EventKind, SseBlock, SseFinalizedCheckpoint, SseHead};
+use eth2::types::{EventKind, SseBlock, SseChainReorg, SseFinalizedCheckpoint, SseHead};
 use fork_choice::ForkChoice;
 use futures::channel::mpsc::Sender;
 use itertools::process_results;
@@ -221,14 +231,28 @@ pub struct BeaconChain<T: BeaconChainTypes> {
     ///
     /// This pool accepts `Attestation` objects that only have one aggregation bit set and provides
     /// a method to get an aggregated `Attestation` for some `AttestationData`.
-    pub naive_aggregation_pool: RwLock<NaiveAggregationPool<T::EthSpec>>,
+    pub naive_aggregation_pool: RwLock<NaiveAggregationPool<AggregatedAttestationMap<T::EthSpec>>>,
+    /// A pool of `SyncCommitteeContribution` dedicated to the "naive aggregation strategy" defined in the eth2
+    /// specs.
+    ///
+    /// This pool accepts `SyncCommitteeContribution` objects that only have one aggregation bit set and provides
+    /// a method to get an aggregated `SyncCommitteeContribution` for some `SyncCommitteeContributionData`.
+    pub naive_sync_aggregation_pool:
+        RwLock<NaiveAggregationPool<SyncContributionAggregateMap<T::EthSpec>>>,
     /// Contains a store of attestations which have been observed by the beacon chain.
-    pub(crate) observed_attestations: RwLock<ObservedAttestations<T::EthSpec>>,
+    pub(crate) observed_attestations: RwLock<ObservedAggregateAttestations<T::EthSpec>>,
+    /// Contains a store of sync contributions which have been observed by the beacon chain.
+    pub(crate) observed_sync_contributions: RwLock<ObservedSyncContributions<T::EthSpec>>,
     /// Maintains a record of which validators have been seen to attest in recent epochs.
     pub(crate) observed_attesters: RwLock<ObservedAttesters<T::EthSpec>>,
+    /// Maintains a record of which validators have been seen sending sync messages in recent epochs.
+    pub(crate) observed_sync_contributors: RwLock<ObservedSyncContributors<T::EthSpec>>,
     /// Maintains a record of which validators have been seen to create `SignedAggregateAndProofs`
     /// in recent epochs.
     pub(crate) observed_aggregators: RwLock<ObservedAggregators<T::EthSpec>>,
+    /// Maintains a record of which validators have been seen to create `SignedContributionAndProofs`
+    /// in recent epochs.
+    pub(crate) observed_sync_aggregators: RwLock<ObservedSyncAggregators<T::EthSpec>>,
     /// Maintains a record of which validators have proposed blocks for each slot.
     pub(crate) observed_block_producers: RwLock<ObservedBlockProducers<T::EthSpec>>,
     /// Maintains a record of which validators have submitted voluntary exits.
@@ -453,6 +477,77 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
         Ok(std::iter::once(Ok((block_root, block.slot())))
             .chain(iter)
             .map(|result| result.map_err(|e| e.into())))
+    }
+
+    /// Iterate through the current chain to find the slot intersecting with the given beacon state.
+    /// The maximum depth this will search is `SLOTS_PER_HISTORICAL_ROOT`, and if that depth is reached
+    /// and no intersection is found, the finalized slot will be returned.
+    pub fn find_reorg_slot(
+        &self,
+        new_state: &BeaconState<T::EthSpec>,
+        new_block_root: Hash256,
+    ) -> Result<Slot, Error> {
+        self.with_head(|snapshot| {
+            let old_state = &snapshot.beacon_state;
+            let old_block_root = snapshot.beacon_block_root;
+
+            // The earliest slot for which the two chains may have a common history.
+            let lowest_slot = std::cmp::min(new_state.slot(), old_state.slot());
+
+            // Create an iterator across `$state`, assuming that the block at `$state.slot` has the
+            // block root of `$block_root`.
+            //
+            // The iterator will be skipped until the next value returns `lowest_slot`.
+            //
+            // This is a macro instead of a function or closure due to the complex types invloved
+            // in all the iterator wrapping.
+            macro_rules! aligned_roots_iter {
+                ($state: ident, $block_root: ident) => {
+                    std::iter::once(Ok(($state.slot(), $block_root)))
+                        .chain($state.rev_iter_block_roots(&self.spec))
+                        .skip_while(|result| {
+                            result
+                                .as_ref()
+                                .map_or(false, |(slot, _)| *slot > lowest_slot)
+                        })
+                };
+            }
+
+            // Create iterators across old/new roots where iterators both start at the same slot.
+            let mut new_roots = aligned_roots_iter!(new_state, new_block_root);
+            let mut old_roots = aligned_roots_iter!(old_state, old_block_root);
+
+            // Whilst *both* of the iterators are still returning values, try and find a common
+            // ancestor between them.
+            while let (Some(old), Some(new)) = (old_roots.next(), new_roots.next()) {
+                let (old_slot, old_root) = old?;
+                let (new_slot, new_root) = new?;
+
+                // Sanity check to detect programming errors.
+                if old_slot != new_slot {
+                    return Err(Error::InvalidReorgSlotIter { new_slot, old_slot });
+                }
+
+                if old_root == new_root {
+                    // A common ancestor has been found.
+                    return Ok(old_slot);
+                }
+            }
+
+            // If no common ancestor is found, declare that the re-org happened at the previous
+            // finalized slot.
+            //
+            // Sometimes this will result in the return slot being *lower* than the actual reorg
+            // slot. However, assuming we don't re-org through a finalized slot, it will never be
+            // *higher*.
+            //
+            // We provide this potentially-inaccurate-but-safe information to avoid onerous
+            // database reads during times of deep reorgs.
+            Ok(old_state
+                .finalized_checkpoint()
+                .epoch
+                .start_slot(T::EthSpec::slots_per_epoch()))
+        })
     }
 
     /// Iterates across all `(state_root, slot)` pairs from the head of the chain (inclusive) to
@@ -721,6 +816,17 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
         self.with_head(|s| {
             Ok(s.beacon_state
                 .clone_with(CloneConfig::committee_caches_only()))
+        })
+    }
+
+    /// Returns the current sync committee at the slot after the head of the canonical chain. This
+    /// is useful because sync committees assigned to `slot` sign for `slot - 1`.
+    ///
+    /// See `Self::head` for more information.
+    pub fn head_sync_committee_next_slot(&self) -> Result<Arc<SyncCommittee<T::EthSpec>>, Error> {
+        self.with_head(|s| {
+            Ok(s.beacon_state
+                .get_sync_committee_for_next_slot(&self.spec)?)
         })
     }
 
@@ -1167,6 +1273,36 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
         })
     }
 
+    /// Accepts some `SyncCommitteeMessage` from the network and attempts to verify it, returning `Ok(_)` if
+    /// it is valid to be (re)broadcast on the gossip network.
+    pub fn verify_sync_committee_message_for_gossip(
+        &self,
+        sync_message: SyncCommitteeMessage,
+        subnet_id: SyncSubnetId,
+    ) -> Result<VerifiedSyncCommitteeMessage, SyncCommitteeError> {
+        metrics::inc_counter(&metrics::SYNC_MESSAGE_PROCESSING_REQUESTS);
+        let _timer = metrics::start_timer(&metrics::SYNC_MESSAGE_GOSSIP_VERIFICATION_TIMES);
+
+        VerifiedSyncCommitteeMessage::verify(sync_message, subnet_id, self).map(|v| {
+            metrics::inc_counter(&metrics::SYNC_MESSAGE_PROCESSING_SUCCESSES);
+            v
+        })
+    }
+
+    /// Accepts some `SignedContributionAndProof` from the network and attempts to verify it,
+    /// returning `Ok(_)` if it is valid to be (re)broadcast on the gossip network.
+    pub fn verify_sync_contribution_for_gossip(
+        &self,
+        sync_contribution: SignedContributionAndProof<T::EthSpec>,
+    ) -> Result<VerifiedSyncContribution<T>, SyncCommitteeError> {
+        metrics::inc_counter(&metrics::SYNC_CONTRIBUTION_PROCESSING_REQUESTS);
+        let _timer = metrics::start_timer(&metrics::SYNC_CONTRIBUTION_GOSSIP_VERIFICATION_TIMES);
+        VerifiedSyncContribution::verify(sync_contribution, self).map(|v| {
+            metrics::inc_counter(&metrics::SYNC_CONTRIBUTION_PROCESSING_SUCCESSES);
+            v
+        })
+    }
+
     /// Accepts some attestation-type object and attempts to verify it in the context of fork
     /// choice. If it is valid it is applied to `self.fork_choice`.
     ///
@@ -1236,6 +1372,70 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
         Ok(unaggregated_attestation)
     }
 
+    /// Accepts a `VerifiedSyncCommitteeMessage` and attempts to apply it to the "naive
+    /// aggregation pool".
+    ///
+    /// The naive aggregation pool is used by local validators to produce
+    /// `SignedContributionAndProof`.
+    ///
+    /// If the sync message is too old (low slot) to be included in the pool it is simply dropped
+    /// and no error is returned.
+    pub fn add_to_naive_sync_aggregation_pool(
+        &self,
+        verified_sync_committee_message: VerifiedSyncCommitteeMessage,
+    ) -> Result<VerifiedSyncCommitteeMessage, SyncCommitteeError> {
+        let sync_message = verified_sync_committee_message.sync_message();
+        let positions_by_subnet_id: &HashMap<SyncSubnetId, Vec<usize>> =
+            verified_sync_committee_message.subnet_positions();
+        for (subnet_id, positions) in positions_by_subnet_id.iter() {
+            for position in positions {
+                let _timer =
+                    metrics::start_timer(&metrics::SYNC_CONTRIBUTION_PROCESSING_APPLY_TO_AGG_POOL);
+                let contribution = SyncCommitteeContribution::from_message(
+                    sync_message,
+                    subnet_id.into(),
+                    *position,
+                )?;
+
+                match self
+                    .naive_sync_aggregation_pool
+                    .write()
+                    .insert(&contribution)
+                {
+                    Ok(outcome) => trace!(
+                        self.log,
+                        "Stored unaggregated sync committee message";
+                        "outcome" => ?outcome,
+                        "index" => sync_message.validator_index,
+                        "slot" => sync_message.slot.as_u64(),
+                    ),
+                    Err(NaiveAggregationError::SlotTooLow {
+                        slot,
+                        lowest_permissible_slot,
+                    }) => {
+                        trace!(
+                            self.log,
+                            "Refused to store unaggregated sync committee message";
+                            "lowest_permissible_slot" => lowest_permissible_slot.as_u64(),
+                            "slot" => slot.as_u64(),
+                        );
+                    }
+                    Err(e) => {
+                        error!(
+                                self.log,
+                                "Failed to store unaggregated sync committee message";
+                                "error" => ?e,
+                                "index" => sync_message.validator_index,
+                                "slot" => sync_message.slot.as_u64(),
+                        );
+                        return Err(Error::from(e).into());
+                    }
+                };
+            }
+        }
+        Ok(verified_sync_committee_message)
+    }
+
     /// Accepts a `VerifiedAggregatedAttestation` and attempts to apply it to `self.op_pool`.
     ///
     /// The op pool is used by local block producers to pack blocks with operations.
@@ -1263,6 +1463,26 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
         }
 
         Ok(signed_aggregate)
+    }
+
+    /// Accepts a `VerifiedSyncContribution` and attempts to apply it to `self.op_pool`.
+    ///
+    /// The op pool is used by local block producers to pack blocks with operations.
+    pub fn add_contribution_to_block_inclusion_pool(
+        &self,
+        contribution: VerifiedSyncContribution<T>,
+    ) -> Result<(), SyncCommitteeError> {
+        let _timer = metrics::start_timer(&metrics::SYNC_CONTRIBUTION_PROCESSING_APPLY_TO_OP_POOL);
+
+        // If there's no eth1 chain then it's impossible to produce blocks and therefore
+        // useless to put things in the op pool.
+        if self.eth1_chain.is_some() {
+            self.op_pool
+                .insert_sync_contribution(contribution.contribution())
+                .map_err(Error::from)?;
+        }
+
+        Ok(())
     }
 
     /// Filter an attestation from the op pool for shuffling compatibility.
@@ -1715,11 +1935,7 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
         // Iterate through the attestations in the block and register them as an "observed
         // attestation". This will stop us from propagating them on the gossip network.
         for a in signed_block.message().body().attestations() {
-            match self
-                .observed_attestations
-                .write()
-                .observe_attestation(a, None)
-            {
+            match self.observed_attestations.write().observe_item(a, None) {
                 // If the observation was successful or if the slot for the attestation was too
                 // low, continue.
                 //
@@ -2298,14 +2514,25 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
         // Note: this will declare a re-org if we skip `SLOTS_PER_HISTORICAL_ROOT` blocks
         // between calls to fork choice without swapping between chains. This seems like an
         // extreme-enough scenario that a warning is fine.
-        let is_reorg = current_head.block_root
-            != new_head
-                .beacon_state
-                .get_block_root(current_head.slot)
-                .map(|root| *root)
-                .unwrap_or_else(|_| Hash256::random());
+        let is_reorg = new_head
+            .beacon_state
+            .get_block_root(current_head.slot)
+            .map_or(true, |root| *root != current_head.block_root);
+
+        let mut reorg_distance = Slot::new(0);
 
         if is_reorg {
+            match self.find_reorg_slot(&new_head.beacon_state, new_head.beacon_block_root) {
+                Ok(slot) => reorg_distance = current_head.slot.saturating_sub(slot),
+                Err(e) => {
+                    warn!(
+                        self.log,
+                        "Could not find re-org depth";
+                        "error" => format!("{:?}", e),
+                    );
+                }
+            }
+
             metrics::inc_counter(&metrics::FORK_CHOICE_REORG_COUNT);
             warn!(
                 self.log,
@@ -2315,6 +2542,7 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
                 "new_head_parent" => %new_head.beacon_block.parent_root(),
                 "new_head" => %beacon_block_root,
                 "new_slot" => new_head.beacon_block.slot(),
+                "reorg_distance" => reorg_distance,
             );
         } else {
             debug!(
@@ -2479,6 +2707,18 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
                         "Unable to find current target root, cannot register head event"
                     );
                 }
+            }
+
+            if is_reorg && event_handler.has_reorg_subscribers() {
+                event_handler.register(EventKind::ChainReorg(SseChainReorg {
+                    slot: head_slot,
+                    depth: reorg_distance.as_u64(),
+                    old_head_block: current_head.block_root,
+                    old_head_state: current_head.state_root,
+                    new_head_block: beacon_block_root,
+                    new_head_state: state_root,
+                    epoch: head_slot.epoch(T::EthSpec::slots_per_epoch()),
+                }));
             }
         }
 
@@ -2829,14 +3069,21 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
         // therefore use the genesis slot.
         let slot = self.slot().unwrap_or(self.spec.genesis_slot);
 
-        self.spec.enr_fork_id(slot, self.genesis_validators_root)
+        self.spec
+            .enr_fork_id::<T::EthSpec>(slot, self.genesis_validators_root)
     }
 
-    /// Calculates the `Duration` to the next fork, if one exists.
-    pub fn duration_to_next_fork(&self) -> Option<Duration> {
-        let epoch = self.spec.next_fork_epoch()?;
+    /// Calculates the `Duration` to the next fork if it exists and returns it
+    /// with it's corresponding `ForkName`.
+    pub fn duration_to_next_fork(&self) -> Option<(ForkName, Duration)> {
+        // If we are unable to read the slot clock we assume that it is prior to genesis and
+        // therefore use the genesis slot.
+        let slot = self.slot().unwrap_or(self.spec.genesis_slot);
+
+        let (fork_name, epoch) = self.spec.next_fork_epoch::<T::EthSpec>(slot)?;
         self.slot_clock
             .duration_to_slot(epoch.start_slot(T::EthSpec::slots_per_epoch()))
+            .map(|duration| (fork_name, duration))
     }
 
     pub fn dump_as_dot<W: Write>(&self, output: &mut W) {
