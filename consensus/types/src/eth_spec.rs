@@ -78,6 +78,8 @@ pub trait EthSpec: 'static + Default + Sync + Send + Clone + Debug + PartialEq +
      * New in Altair
      */
     type SyncCommitteeSize: Unsigned + Clone + Sync + Send + Debug + PartialEq;
+    /// The number of `sync_committee` subnets.
+    type SyncCommitteeSubnetCount: Unsigned + Clone + Sync + Send + Debug + PartialEq;
     /*
      * Derived values (set these CAREFULLY)
      */
@@ -91,6 +93,10 @@ pub trait EthSpec: 'static + Default + Sync + Send + Clone + Debug + PartialEq +
     ///
     /// Must be set to `EpochsPerEth1VotingPeriod * SlotsPerEpoch`
     type SlotsPerEth1VotingPeriod: Unsigned + Clone + Sync + Send + Debug + PartialEq;
+    /// The size of `sync_subcommittees`.
+    ///
+    /// Must be set to `SyncCommitteeSize / SyncCommitteeSubnetCount`.
+    type SyncSubcommitteeSize: Unsigned + Clone + Sync + Send + Debug + PartialEq;
 
     fn default_spec() -> ChainSpec;
 
@@ -171,6 +177,16 @@ pub trait EthSpec: 'static + Default + Sync + Send + Clone + Debug + PartialEq +
     fn slots_per_eth1_voting_period() -> usize {
         Self::SlotsPerEth1VotingPeriod::to_usize()
     }
+
+    /// Returns the `SYNC_COMMITTEE_SIZE` constant for this specification.
+    fn sync_committee_size() -> usize {
+        Self::SyncCommitteeSize::to_usize()
+    }
+
+    /// Returns the `SYNC_COMMITTEE_SIZE / SyncCommitteeSubnetCount`.
+    fn sync_subcommittee_size() -> usize {
+        Self::SyncSubcommitteeSize::to_usize()
+    }
 }
 
 /// Macro to inherit some type values from another EthSpec.
@@ -204,6 +220,8 @@ impl EthSpec for MainnetEthSpec {
     type MaxDeposits = U16;
     type MaxVoluntaryExits = U16;
     type SyncCommitteeSize = U512;
+    type SyncCommitteeSubnetCount = U4;
+    type SyncSubcommitteeSize = U128; // 512 committee size / 4 sync committee subnet count
     type MaxPendingAttestations = U4096; // 128 max attestations * 32 slots per epoch
     type SlotsPerEth1VotingPeriod = U2048; // 64 epochs * 32 slots per epoch
 
@@ -228,12 +246,14 @@ impl EthSpec for MinimalEthSpec {
     type EpochsPerHistoricalVector = U64;
     type EpochsPerSlashingsVector = U64;
     type SyncCommitteeSize = U32;
+    type SyncSubcommitteeSize = U8; // 32 committee size / 4 sync committee subnet count
     type MaxPendingAttestations = U1024; // 128 max attestations * 8 slots per epoch
     type SlotsPerEth1VotingPeriod = U32; // 4 epochs * 8 slots per epoch
 
     params_from_eth_spec!(MainnetEthSpec {
         JustificationBitsLength,
         SubnetBitfieldLength,
+        SyncCommitteeSubnetCount,
         MaxValidatorsPerCommittee,
         GenesisEpoch,
         HistoricalRootsLimit,

@@ -12,6 +12,14 @@ pub use types::*;
 
 /// An API error serializable to JSON.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Error {
+    Indexed(IndexedErrorMessage),
+    Message(ErrorMessage),
+}
+
+/// An API error serializable to JSON.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ErrorMessage {
     pub code: u16,
     pub message: String,
@@ -445,6 +453,7 @@ pub struct MetaData {
     #[serde(with = "serde_utils::quoted_u64")]
     pub seq_number: u64,
     pub attnets: String,
+    pub syncnets: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

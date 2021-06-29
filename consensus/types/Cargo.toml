@@ -22,7 +22,7 @@ merkle_proof = { path = "../merkle_proof" }
 rayon = "1.4.1"
 rand = "0.7.3"
 safe_arith = { path = "../safe_arith" }
-serde = "1.0.116"
+serde = {version = "1.0.116" , features = ["rc"] }
 serde_derive = "1.0.116"
 slog = "2.5.2"
 eth2_ssz = "0.1.2"
@@ -50,6 +50,7 @@ superstruct = "0.2.0"
 serde_json = "1.0.58"
 criterion = "0.3.3"
 beacon_chain = { path = "../../beacon_node/beacon_chain" }
+eth2_interop_keypairs = { path = "../../common/eth2_interop_keypairs" }
 
 [features]
 default = ["sqlite", "legacy-arith"]
