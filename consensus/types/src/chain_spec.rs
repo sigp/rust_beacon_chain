@@ -136,6 +136,7 @@ pub struct ChainSpec {
     pub maximum_gossip_clock_disparity_millis: u64,
     pub target_aggregators_per_committee: u64,
     pub attestation_subnet_count: u64,
+    pub sync_committee_subnet_count: u64,
     pub random_subnets_per_validator: u64,
     pub epochs_per_random_subnet_subscription: u64,
 }
@@ -168,14 +169,11 @@ impl ChainSpec {
     /// If `self.altair_fork_epoch == None`, then this function returns the genesis fork digest
     /// otherwise, returns the fork digest based on the slot.
     pub fn fork_digest<T: EthSpec>(&self, slot: Slot, genesis_validators_root: Hash256) -> [u8; 4] {
-        match self.fork_name_at_slot::<T>(slot) {
-            ForkName::Altair => {
-                Self::compute_fork_digest(self.altair_fork_version, genesis_validators_root)
-            }
-            ForkName::Base => {
-                Self::compute_fork_digest(self.genesis_fork_version, genesis_validators_root)
-            }
-        }
+        let fork_name = self.fork_name_at_slot::<T>(slot);
+        Self::compute_fork_digest(
+            self.fork_version_for_name(fork_name),
+            genesis_validators_root,
+        )
     }
 
     /// Returns the `next_fork_version`.
@@ -186,16 +184,14 @@ impl ChainSpec {
         self.altair_fork_version
     }
 
-    /// Returns the epoch of the next scheduled fork along with it's corresponding `ForkName`.
+    /// Returns the epoch of the next scheduled fork along with its corresponding `ForkName`.
     ///
     /// If no future forks are scheduled, this function returns `None`.
     pub fn next_fork_epoch<T: EthSpec>(&self, slot: Slot) -> Option<(ForkName, Epoch)> {
-        match self.fork_name_at_slot::<T>(slot) {
-            ForkName::Altair => None,
-            ForkName::Base => self
-                .altair_fork_epoch
-                .map(|epoch| (ForkName::Altair, epoch)),
-        }
+        let current_fork_name = self.fork_name_at_slot::<T>(slot);
+        let next_fork_name = current_fork_name.next_fork()?;
+        let fork_epoch = self.fork_epoch(next_fork_name)?;
+        Some((next_fork_name, fork_epoch))
     }
 
     /// Returns the name of the fork which is active at `slot`.
@@ -208,6 +204,37 @@ impl ChainSpec {
         match self.altair_fork_epoch {
             Some(fork_epoch) if epoch >= fork_epoch => ForkName::Altair,
             _ => ForkName::Base,
+        }
+    }
+
+    /// Returns the fork version for a named fork.
+    pub fn fork_version_for_name(&self, fork_name: ForkName) -> [u8; 4] {
+        match fork_name {
+            ForkName::Base => self.genesis_fork_version,
+            ForkName::Altair => self.altair_fork_version,
+        }
+    }
+
+    /// For a given fork name, return the epoch at which it activates.
+    pub fn fork_epoch(&self, fork_name: ForkName) -> Option<Epoch> {
+        match fork_name {
+            ForkName::Base => Some(Epoch::new(0)),
+            ForkName::Altair => self.altair_fork_epoch,
+        }
+    }
+
+    /// Returns a full `Fork` struct for a given epoch.
+    pub fn fork_at_epoch(&self, epoch: Epoch) -> Fork {
+        let current_fork_name = self.fork_name_at_epoch(epoch);
+        let previous_fork_name = current_fork_name.previous_fork().unwrap_or(ForkName::Base);
+        let epoch = self
+            .fork_epoch(current_fork_name)
+            .unwrap_or_else(|| Epoch::new(0));
+
+        Fork {
+            previous_version: self.fork_version_for_name(previous_fork_name),
+            current_version: self.fork_version_for_name(current_fork_name),
+            epoch,
         }
     }
 
@@ -437,6 +464,7 @@ impl ChainSpec {
             network_id: 1, // mainnet network id
             attestation_propagation_slot_range: 32,
             attestation_subnet_count: 64,
+            sync_committee_subnet_count: 4,
             random_subnets_per_validator: 1,
             maximum_gossip_clock_disparity_millis: 500,
             target_aggregators_per_committee: 16,
@@ -659,6 +687,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use itertools::Itertools;
+    use safe_arith::SafeArith;
 
     #[test]
     fn test_mainnet_spec_can_be_constructed() {
@@ -706,6 +736,18 @@ mod tests {
             &spec,
         );
         test_domain(Domain::SyncCommittee, spec.domain_sync_committee, &spec);
+    }
+
+    // Test that `fork_name_at_epoch` and `fork_epoch` are consistent.
+    #[test]
+    fn fork_name_at_epoch_consistency() {
+        let spec = ChainSpec::mainnet();
+
+        for fork_name in ForkName::list_all() {
+            if let Some(fork_epoch) = spec.fork_epoch(fork_name) {
+                assert_eq!(spec.fork_name_at_epoch(fork_epoch), fork_name);
+            }
+        }
     }
 }
 
