@@ -975,7 +975,7 @@ impl<'a, T: BeaconChainTypes> FullyVerifiedBlock<'a, T> {
             }
         }
 
-        expose_participation_metrics(&summaries);
+        expose_participation_metrics(&summaries, &chain.log);
 
         // If the block is sufficiently recent, notify the validator monitor.
         if let Some(slot) = chain.slot_clock.now() {
@@ -990,7 +990,15 @@ impl<'a, T: BeaconChainTypes> FullyVerifiedBlock<'a, T> {
                 // performing `per_slot_processing`.
                 for (i, summary) in summaries.iter().enumerate() {
                     let epoch = state.current_epoch() - Epoch::from(summaries.len() - i);
-                    validator_monitor.process_validator_statuses(epoch, &summary.statuses);
+                    if let Err(e) =
+                        validator_monitor.process_validator_statuses(epoch, &summary, &chain.spec)
+                    {
+                        error!(
+                            chain.log,
+                            "Failed to process validator statuses";
+                            "error" => ?e
+                        );
+                    }
                 }
             }
         }
@@ -1432,28 +1440,45 @@ fn verify_header_signature<T: BeaconChainTypes>(
     }
 }
 
-fn expose_participation_metrics(summaries: &[EpochProcessingSummary]) {
+fn expose_participation_metrics(summaries: &[EpochProcessingSummary], log: &Logger) {
     if !cfg!(feature = "participation_metrics") {
         return;
     }
 
     for summary in summaries {
-        let b = &summary.total_balances;
+        match summary.previous_epoch_target_attesting_balance() {
+            Ok(target_balance) => {
+                metrics::maybe_set_float_gauge(
+                    &metrics::PARTICIPATION_PREV_EPOCH_TARGET_ATTESTER,
+                    participation_ratio(
+                        target_balance,
+                        summary.previous_epoch_total_active_balance(),
+                    ),
+                );
+            }
+            Err(e) => error!(
+                log,
+                "Unable to read target balance";
+                "error" => ?e,
+            ),
+        }
 
-        metrics::maybe_set_float_gauge(
-            &metrics::PARTICIPATION_PREV_EPOCH_ATTESTER,
-            participation_ratio(b.previous_epoch_attesters(), b.previous_epoch()),
-        );
-
-        metrics::maybe_set_float_gauge(
-            &metrics::PARTICIPATION_PREV_EPOCH_TARGET_ATTESTER,
-            participation_ratio(b.previous_epoch_target_attesters(), b.previous_epoch()),
-        );
-
-        metrics::maybe_set_float_gauge(
-            &metrics::PARTICIPATION_PREV_EPOCH_HEAD_ATTESTER,
-            participation_ratio(b.previous_epoch_head_attesters(), b.previous_epoch()),
-        );
+        match summary.previous_epoch_head_attesting_balance() {
+            Ok(head_balance) => {
+                metrics::maybe_set_float_gauge(
+                    &metrics::PARTICIPATION_PREV_EPOCH_HEAD_ATTESTER,
+                    participation_ratio(
+                        head_balance,
+                        summary.previous_epoch_total_active_balance(),
+                    ),
+                );
+            }
+            Err(e) => error!(
+                log,
+                "Unable to read head balance";
+                "error" => ?e,
+            ),
+        }
     }
 }
 
