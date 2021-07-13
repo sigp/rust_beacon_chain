@@ -117,3 +117,10 @@ define_net!(
     "altair-devnet-0",
     true
 );
+
+define_net!(
+    altair_devnet_1,
+    include_altair_devnet_1_file,
+    "altair-devnet-1",
+    true
+);

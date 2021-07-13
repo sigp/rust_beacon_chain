@@ -40,8 +40,10 @@ const PYRMONT: HardcodedNet = define_net!(pyrmont, include_pyrmont_file);
 const MAINNET: HardcodedNet = define_net!(mainnet, include_mainnet_file);
 const PRATER: HardcodedNet = define_net!(prater, include_prater_file);
 const ALTAIR_DEVNET_0: HardcodedNet = define_net!(altair_devnet_0, include_altair_devnet_0_file);
+const ALTAIR_DEVNET_1: HardcodedNet = define_net!(altair_devnet_1, include_altair_devnet_1_file);
 
-const HARDCODED_NETS: &[HardcodedNet] = &[PYRMONT, MAINNET, PRATER, ALTAIR_DEVNET_0];
+const HARDCODED_NETS: &[HardcodedNet] =
+    &[PYRMONT, MAINNET, PRATER, ALTAIR_DEVNET_0, ALTAIR_DEVNET_1];
 pub const DEFAULT_HARDCODED_NETWORK: &str = "mainnet";
 
 /// Specifies an Eth2 network.
