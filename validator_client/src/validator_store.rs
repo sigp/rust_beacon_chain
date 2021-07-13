@@ -6,6 +6,7 @@ use parking_lot::{Mutex, RwLock};
 use slashing_protection::{NotSafe, Safe, SlashingDatabase};
 use slog::{crit, error, info, warn, Logger};
 use slot_clock::SlotClock;
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
 use tempfile::TempDir;
@@ -83,6 +84,10 @@ impl<T: SlotClock + 'static, E: EthSpec> ValidatorStore<T, E> {
         self.validators.clone()
     }
 
+    pub fn slot_clock(&self) -> T {
+        self.fork_service.slot_clock()
+    }
+
     /// Insert a new validator to `self`, where the validator is represented by an EIP-2335
     /// keystore on the filesystem.
     ///
@@ -97,6 +102,8 @@ impl<T: SlotClock + 'static, E: EthSpec> ValidatorStore<T, E> {
         password: ZeroizeString,
         enable: bool,
         graffiti: Option<GraffitiString>,
+        current_epoch: Epoch,
+        genesis_epoch: Epoch,
     ) -> Result<ValidatorDefinition, String> {
         let mut validator_def = ValidatorDefinition::new_keystore_with_password(
             voting_keystore_path,
@@ -113,17 +120,41 @@ impl<T: SlotClock + 'static, E: EthSpec> ValidatorStore<T, E> {
 
         self.validators
             .write()
-            .add_definition(validator_def.clone())
+            .add_definition(validator_def.clone(), current_epoch, genesis_epoch)
             .await
             .map_err(|e| format!("Unable to add definition: {:?}", e))?;
 
         Ok(validator_def)
     }
 
-    pub fn voting_pubkeys(&self) -> Vec<PublicKeyBytes> {
+    /// Returns all public keys that are required for duties collection. This includes all initialized
+    /// validators regardless of doppelganger detection status. We want to continue to collect duties
+    /// during doppelganger detection periods because we want to continue to subscribe to the correct
+    /// subnets.
+    pub fn duties_collection_pubkeys(&self) -> Vec<PublicKeyBytes> {
         self.validators
             .read()
-            .iter_voting_pubkeys()
+            .iter_duties_collection_pubkeys()
+            .cloned()
+            .collect()
+    }
+
+    /// Returns a `Vec` of all public keys that are required for signing attestations and blocks.
+    /// This will exclude initialized validators that are currently in a doppelganger detection period.
+    pub fn signing_pubkeys(&self) -> Vec<PublicKeyBytes> {
+        self.validators
+            .read()
+            .iter_signing_pubkeys()
+            .cloned()
+            .collect()
+    }
+
+    /// Returns a `HashSet` of all public keys that are required for signing attestations and blocks.
+    /// This will exclude initialized validators that are currently in a doppelganger detection period.
+    pub fn signing_pubkeys_hashset(&self) -> HashSet<PublicKeyBytes> {
+        self.validators
+            .read()
+            .iter_signing_pubkeys()
             .cloned()
             .collect()
     }
@@ -412,10 +443,10 @@ impl<T: SlotClock + 'static, E: EthSpec> ValidatorStore<T, E> {
         let new_min_slot = new_min_target_epoch.start_slot(E::slots_per_epoch());
 
         let validators = self.validators.read();
-        if let Err(e) = self
-            .slashing_protection
-            .prune_all_signed_attestations(validators.iter_voting_pubkeys(), new_min_target_epoch)
-        {
+        if let Err(e) = self.slashing_protection.prune_all_signed_attestations(
+            validators.iter_duties_collection_pubkeys(),
+            new_min_target_epoch,
+        ) {
             error!(
                 self.log,
                 "Error during pruning of signed attestations";
@@ -426,7 +457,7 @@ impl<T: SlotClock + 'static, E: EthSpec> ValidatorStore<T, E> {
 
         if let Err(e) = self
             .slashing_protection
-            .prune_all_signed_blocks(validators.iter_voting_pubkeys(), new_min_slot)
+            .prune_all_signed_blocks(validators.iter_duties_collection_pubkeys(), new_min_slot)
         {
             error!(
                 self.log,

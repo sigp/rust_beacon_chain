@@ -13,6 +13,7 @@ mod key_cache;
 mod notifier;
 mod validator_store;
 
+mod doppelganger_service;
 pub mod http_api;
 
 pub use cli::cli_app;
@@ -23,6 +24,7 @@ use monitoring_api::{MonitoringHttpClient, ProcessType};
 use crate::beacon_node_fallback::{
     start_fallback_updater_service, BeaconNodeFallback, CandidateBeaconNode, RequireSynced,
 };
+use crate::doppelganger_service::DoppelgangerService;
 use account_utils::validator_definitions::ValidatorDefinitions;
 use attestation_service::{AttestationService, AttestationServiceBuilder};
 use block_service::{BlockService, BlockServiceBuilder};
@@ -71,6 +73,7 @@ pub struct ProductionValidatorClient<T: EthSpec> {
     fork_service: ForkService<SystemTimeSlotClock, T>,
     block_service: BlockService<SystemTimeSlotClock, T>,
     attestation_service: AttestationService<SystemTimeSlotClock, T>,
+    doppelganger_service: Option<DoppelgangerService<SystemTimeSlotClock, T>>,
     validator_store: ValidatorStore<SystemTimeSlotClock, T>,
     http_api_listen_addr: Option<SocketAddr>,
     http_metrics_ctx: Option<Arc<http_metrics::Context<T>>>,
@@ -162,12 +165,15 @@ impl<T: EthSpec> ProductionValidatorClient<T> {
         let validators = InitializedValidators::from_definitions(
             validator_defs,
             config.validator_dir.clone(),
+            config.disable_doppelganger_detection,
+            None,
+            None,
             log.clone(),
         )
         .await
         .map_err(|e| format!("Unable to initialize validators: {:?}", e))?;
 
-        let voting_pubkeys: Vec<_> = validators.iter_voting_pubkeys().collect();
+        let voting_pubkeys: Vec<_> = validators.iter_duties_collection_pubkeys().collect();
 
         info!(
             log,
@@ -339,7 +345,6 @@ impl<T: EthSpec> ProductionValidatorClient<T> {
         let duties_service = Arc::new(DutiesService {
             attesters: <_>::default(),
             proposers: <_>::default(),
-            indices: <_>::default(),
             slot_clock: slot_clock.clone(),
             beacon_nodes: beacon_nodes.clone(),
             validator_store: validator_store.clone(),
@@ -369,7 +374,7 @@ impl<T: EthSpec> ProductionValidatorClient<T> {
 
         let attestation_service = AttestationServiceBuilder::new()
             .duties_service(duties_service.clone())
-            .slot_clock(slot_clock)
+            .slot_clock(slot_clock.clone())
             .validator_store(validator_store.clone())
             .beacon_nodes(beacon_nodes.clone())
             .runtime_context(context.service_context("attestation".into()))
@@ -381,12 +386,21 @@ impl<T: EthSpec> ProductionValidatorClient<T> {
         // of making too many changes this close to genesis (<1 week).
         wait_for_genesis(&beacon_nodes, genesis_time, &context).await?;
 
+        let doppelganger_service =
+            (!config.disable_doppelganger_detection).then(|| DoppelgangerService {
+                slot_clock: slot_clock.clone(),
+                validator_store: validator_store.clone(),
+                beacon_nodes: beacon_nodes.clone(),
+                context: context.service_context("doppelganger".into()),
+            });
+
         Ok(Self {
             context,
             duties_service,
             fork_service,
             block_service,
             attestation_service,
+            doppelganger_service,
             validator_store,
             config,
             http_api_listen_addr: None,
@@ -418,6 +432,15 @@ impl<T: EthSpec> ProductionValidatorClient<T> {
             .clone()
             .start_update_service(&self.context.eth2_config.spec)
             .map_err(|e| format!("Unable to start attestation service: {}", e))?;
+
+        if let Some(doppelganger_service) = self.doppelganger_service.as_ref() {
+            doppelganger_service
+                .clone()
+                .start_update_service()
+                .map_err(|e| format!("Unable to start doppelganger service: {}", e))?
+        } else {
+            info!(log, "Doppelganger detection disabled.")
+        }
 
         spawn_notifier(self).map_err(|e| format!("Failed to start notifier: {}", e))?;
 

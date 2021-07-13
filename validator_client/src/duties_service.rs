@@ -84,7 +84,6 @@ type DependentRoot = Hash256;
 
 type AttesterMap = HashMap<PublicKeyBytes, HashMap<Epoch, (DependentRoot, DutyAndProof)>>;
 type ProposerMap = HashMap<Epoch, (DependentRoot, Vec<ProposerData>)>;
-type IndicesMap = HashMap<PublicKeyBytes, u64>;
 
 /// See the module-level documentation.
 pub struct DutiesService<T, E: EthSpec> {
@@ -93,9 +92,6 @@ pub struct DutiesService<T, E: EthSpec> {
     /// Maps an epoch to all *local* proposers in this epoch. Notably, this does not contain
     /// proposals for any validators which are not registered locally.
     pub proposers: RwLock<ProposerMap>,
-    /// Maps a public key to a validator index. There is a task which ensures this map is kept
-    /// up-to-date.
-    pub indices: RwLock<IndicesMap>,
     /// Provides the canonical list of locally-managed validators.
     pub validator_store: ValidatorStore<T, E>,
     /// Tracks the current slot.
@@ -141,13 +137,19 @@ impl<T: SlotClock + 'static, E: EthSpec> DutiesService<T, E> {
     pub fn block_proposers(&self, slot: Slot) -> HashSet<PublicKeyBytes> {
         let epoch = slot.epoch(E::slots_per_epoch());
 
+        // this is the set of local pubkeys that are not currently in a doppelganger detection period
+        let signing_pubkeys = self.validator_store.signing_pubkeys_hashset();
+
         self.proposers
             .read()
             .get(&epoch)
             .map(|(_, proposers)| {
                 proposers
                     .iter()
-                    .filter(|proposer_data| proposer_data.slot == slot)
+                    .filter(|proposer_data| {
+                        proposer_data.slot == slot
+                            && signing_pubkeys.contains(&proposer_data.pubkey)
+                    })
                     .map(|proposer_data| proposer_data.pubkey)
                     .collect()
             })
@@ -158,12 +160,18 @@ impl<T: SlotClock + 'static, E: EthSpec> DutiesService<T, E> {
     pub fn attesters(&self, slot: Slot) -> Vec<DutyAndProof> {
         let epoch = slot.epoch(E::slots_per_epoch());
 
+        // this is the set of local pubkeys that are not currently in a doppelganger detection period
+        let signing_pubkeys = self.validator_store.signing_pubkeys_hashset();
+
         self.attesters
             .read()
             .iter()
             .filter_map(|(_, map)| map.get(&epoch))
             .map(|(_, duty_and_proof)| duty_and_proof)
-            .filter(|duty_and_proof| duty_and_proof.duty.slot == slot)
+            .filter(|duty_and_proof| {
+                duty_and_proof.duty.slot == slot
+                    && signing_pubkeys.contains(&duty_and_proof.duty.pubkey)
+            })
             .cloned()
             .collect()
     }
@@ -276,9 +284,14 @@ async fn poll_validator_indices<T: SlotClock + 'static, E: EthSpec>(
         metrics::start_timer_vec(&metrics::DUTIES_SERVICE_TIMES, &[metrics::UPDATE_INDICES]);
 
     let log = duties_service.context.log();
-    for pubkey in duties_service.validator_store.voting_pubkeys() {
+    for pubkey in duties_service.validator_store.duties_collection_pubkeys() {
         // This is on its own line to avoid some weirdness with locks and if statements.
-        let is_known = duties_service.indices.read().contains_key(&pubkey);
+        let is_known = duties_service
+            .validator_store
+            .initialized_validators()
+            .read()
+            .get_index(&pubkey)
+            .is_some();
 
         if !is_known {
             // Query the remote BN to resolve a pubkey to a validator index.
@@ -307,9 +320,10 @@ async fn poll_validator_indices<T: SlotClock + 'static, E: EthSpec>(
                         "validator_index" => response.data.index
                     );
                     duties_service
-                        .indices
+                        .validator_store
+                        .initialized_validators()
                         .write()
-                        .insert(pubkey, response.data.index);
+                        .set_index(&pubkey, response.data.index);
                 }
                 // This is not necessarily an error, it just means the validator is not yet known to
                 // the beacon chain.
@@ -361,16 +375,18 @@ async fn poll_beacon_attesters<T: SlotClock + 'static, E: EthSpec>(
 
     let local_pubkeys: HashSet<PublicKeyBytes> = duties_service
         .validator_store
-        .voting_pubkeys()
+        .duties_collection_pubkeys()
         .into_iter()
         .collect();
 
     let local_indices = {
         let mut local_indices = Vec::with_capacity(local_pubkeys.len());
-        let indices_map = duties_service.indices.read();
+
+        let vals_ref = duties_service.validator_store.initialized_validators();
+        let vals = vals_ref.read();
         for &pubkey in &local_pubkeys {
-            if let Some(validator_index) = indices_map.get(&pubkey) {
-                local_indices.push(*validator_index)
+            if let Some(validator_index) = vals.get_index(&pubkey) {
+                local_indices.push(validator_index)
             }
         }
         local_indices
@@ -642,7 +658,7 @@ async fn poll_beacon_proposers<T: SlotClock + 'static, E: EthSpec>(
 
     let local_pubkeys: HashSet<PublicKeyBytes> = duties_service
         .validator_store
-        .voting_pubkeys()
+        .duties_collection_pubkeys()
         .into_iter()
         .collect();
 
