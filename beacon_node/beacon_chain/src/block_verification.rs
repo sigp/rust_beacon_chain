@@ -72,7 +72,8 @@ use store::{Error as DBError, HotColdDB, HotStateSummary, KeyValueStore, StoreOp
 use tree_hash::TreeHash;
 use types::{
     BeaconBlockRef, BeaconState, BeaconStateError, ChainSpec, CloneConfig, Epoch, EthSpec, Hash256,
-    InconsistentFork, PublicKey, RelativeEpoch, SignedBeaconBlock, SignedBeaconBlockHeader, Slot,
+    InconsistentFork, PublicKey, PublicKeyBytes, RelativeEpoch, SignedBeaconBlock,
+    SignedBeaconBlockHeader, Slot,
 };
 
 /// Maximum block slot number. Block with slots bigger than this constant will NOT be processed.
@@ -990,7 +991,7 @@ impl<'a, T: BeaconChainTypes> FullyVerifiedBlock<'a, T> {
                 // performing `per_slot_processing`.
                 for (i, summary) in summaries.iter().enumerate() {
                     let epoch = state.current_epoch() - Epoch::from(summaries.len() - i);
-                    validator_monitor.process_validator_statuses(epoch, &summary.statuses);
+                    validator_monitor.process_validator_statuses(epoch, &summary, &chain.spec);
                 }
             }
         }
@@ -1382,22 +1383,31 @@ fn get_signature_verifier<'a, T: BeaconChainTypes>(
     state: &'a BeaconState<T::EthSpec>,
     validator_pubkey_cache: &'a ValidatorPubkeyCache<T>,
     spec: &'a ChainSpec,
-) -> BlockSignatureVerifier<'a, T::EthSpec, impl Fn(usize) -> Option<Cow<'a, PublicKey>> + Clone> {
-    BlockSignatureVerifier::new(
-        state,
-        move |validator_index| {
-            // Disallow access to any validator pubkeys that are not in the current beacon
-            // state.
-            if validator_index < state.validators().len() {
-                validator_pubkey_cache
-                    .get(validator_index)
-                    .map(|pk| Cow::Borrowed(pk))
-            } else {
-                None
-            }
-        },
-        spec,
-    )
+) -> BlockSignatureVerifier<
+    'a,
+    T::EthSpec,
+    impl Fn(usize) -> Option<Cow<'a, PublicKey>> + Clone,
+    impl Fn(&'a PublicKeyBytes) -> Option<Cow<'a, PublicKey>>,
+> {
+    let get_pubkey = move |validator_index| {
+        // Disallow access to any validator pubkeys that are not in the current beacon state.
+        if validator_index < state.validators().len() {
+            validator_pubkey_cache
+                .get(validator_index)
+                .map(Cow::Borrowed)
+        } else {
+            None
+        }
+    };
+
+    let decompressor = move |pk_bytes| {
+        // Map compressed pubkey to validator index.
+        let validator_index = validator_pubkey_cache.get_index(pk_bytes)?;
+        // Map validator index to pubkey (respecting guard on unknown validators).
+        get_pubkey(validator_index)
+    };
+
+    BlockSignatureVerifier::new(state, get_pubkey, decompressor, spec)
 }
 
 /// Verify that `header` was signed with a valid signature from its proposer.
@@ -1438,22 +1448,22 @@ fn expose_participation_metrics(summaries: &[EpochProcessingSummary]) {
     }
 
     for summary in summaries {
-        let b = &summary.total_balances;
+        if let Ok(target_balance) = summary.previous_epoch_target_attesting_balance() {
+            metrics::maybe_set_float_gauge(
+                &metrics::PARTICIPATION_PREV_EPOCH_TARGET_ATTESTER,
+                participation_ratio(
+                    target_balance,
+                    summary.previous_epoch_total_active_balance(),
+                ),
+            );
+        }
 
-        metrics::maybe_set_float_gauge(
-            &metrics::PARTICIPATION_PREV_EPOCH_ATTESTER,
-            participation_ratio(b.previous_epoch_attesters(), b.previous_epoch()),
-        );
-
-        metrics::maybe_set_float_gauge(
-            &metrics::PARTICIPATION_PREV_EPOCH_TARGET_ATTESTER,
-            participation_ratio(b.previous_epoch_target_attesters(), b.previous_epoch()),
-        );
-
-        metrics::maybe_set_float_gauge(
-            &metrics::PARTICIPATION_PREV_EPOCH_HEAD_ATTESTER,
-            participation_ratio(b.previous_epoch_head_attesters(), b.previous_epoch()),
-        );
+        if let Ok(head_balance) = summary.previous_epoch_head_attesting_balance() {
+            metrics::maybe_set_float_gauge(
+                &metrics::PARTICIPATION_PREV_EPOCH_HEAD_ATTESTER,
+                participation_ratio(head_balance, summary.previous_epoch_total_active_balance()),
+            );
+        }
     }
 }
 

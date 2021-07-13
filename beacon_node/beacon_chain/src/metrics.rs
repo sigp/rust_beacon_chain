@@ -56,6 +56,10 @@ lazy_static! {
         "beacon_block_processing_attestation_observation_seconds",
         "Time spent hashing and remembering all the attestations in the block"
     );
+    pub static ref BLOCK_SYNC_AGGREGATE_SET_BITS: Result<IntGauge> = try_create_int_gauge(
+        "block_sync_aggregate_set_bits",
+        "The number of true bits in the last sync aggregate in a block"
+    );
 
     /*
      * Block Production
@@ -329,10 +333,6 @@ lazy_static! {
     /*
      * Participation Metrics
      */
-    pub static ref PARTICIPATION_PREV_EPOCH_ATTESTER: Result<Gauge> = try_create_float_gauge(
-        "beacon_participation_prev_epoch_attester",
-        "Ratio of attesting balances to total balances"
-    );
     pub static ref PARTICIPATION_PREV_EPOCH_TARGET_ATTESTER: Result<Gauge> = try_create_float_gauge(
         "beacon_participation_prev_epoch_target_attester",
         "Ratio of target-attesting balances to total balances"
